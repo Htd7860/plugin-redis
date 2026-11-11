@@ -1,7 +1,9 @@
 package io.kestra.plugin.redis.list;
 
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.reactivestreams.Publisher;
 
@@ -29,7 +31,7 @@ import reactor.core.publisher.Flux;
 @NoArgsConstructor
 @Schema(
     title = "Realtime trigger from a Redis list",
-    description = "Continuously polls `LPOP` one element at a time (every ~100 ms) and starts one Execution per item. Use [Trigger](https://kestra.io/plugins/plugin-redis/triggers/io.kestra.plugin.redis.list.trigger) for batched polling."
+    description = "Continuously polls `LPOP` one element at a time (every ~100 ms) and starts one Execution per item. Cancellation or shutdown closes the active connection and stops polling; an already sent pop cannot be rolled back. Use [Trigger](https://kestra.io/plugins/plugin-redis/triggers/io.kestra.plugin.redis.list.trigger) for batched polling."
 )
 @Plugin(
     examples = {
@@ -77,7 +79,13 @@ public class RealtimeTrigger extends AbstractTrigger implements RealtimeTriggerI
     @Getter(AccessLevel.NONE)
     @ToString.Exclude
     @EqualsAndHashCode.Exclude
-    private final CountDownLatch waitForTermination = new CountDownLatch(1);
+    private final AtomicReference<CountDownLatch> waitForTermination = new AtomicReference<>();
+
+    @Builder.Default
+    @Getter(AccessLevel.NONE)
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
+    private final AtomicReference<AbstractRedisConnection.RedisFactory> factoryRef = new AtomicReference<>();
 
     @Override
     public Publisher<Execution> evaluate(ConditionContext conditionContext, TriggerContext context) {
@@ -97,25 +105,44 @@ public class RealtimeTrigger extends AbstractTrigger implements RealtimeTriggerI
         return Flux.create(
             fluxSink ->
             {
-                try (AbstractRedisConnection.RedisFactory factory = task.redisFactory(runContext)) {
-                    String renderedKey = runContext.render(this.key).as(String.class).orElseThrow();
-                    var rSerdeType = runContext.render(this.serdeType).as(SerdeType.class).orElse(SerdeType.STRING);
+                var termination = new CountDownLatch(1);
+                waitForTermination.set(termination);
 
-                    while (isActive.get()) {
-                        factory.getSyncCommands().lpop(renderedKey, 1)
-                            .forEach(s -> fluxSink.next(ListPop.deserialize(runContext, renderedKey, rSerdeType, s)));
-                        try {
-                            Thread.sleep(100);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            isActive.set(false); // proactively stop polling
-                        }
+                try {
+                    if (!isActive.get() || fluxSink.isCancelled()) {
+                        return;
                     }
-                } catch (Throwable e) {
-                    fluxSink.error(e);
+
+                    try (var factory = task.redisFactory(runContext)) {
+                        factoryRef.set(factory);
+                        fluxSink.onCancel(factory::closeAsync);
+
+                        String rKey = runContext.render(this.key).as(String.class).orElseThrow();
+                        var rSerdeType = runContext.render(this.serdeType).as(SerdeType.class).orElse(SerdeType.STRING);
+
+                        while (isActive.get() && !fluxSink.isCancelled()) {
+                            factory.getSyncCommands().lpop(rKey, 1)
+                                .forEach(s -> fluxSink.next(ListPop.deserialize(runContext, rKey, rSerdeType, s)));
+                            if (!isActive.get() || fluxSink.isCancelled()) {
+                                break;
+                            }
+                            try {
+                                Thread.sleep(100);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+                                isActive.set(false);
+                            }
+                        }
+                    } finally {
+                        factoryRef.set(null);
+                    }
+                } catch (Exception e) {
+                    if (isActive.get() && !fluxSink.isCancelled()) {
+                        fluxSink.error(e);
+                    }
                 } finally {
+                    termination.countDown();
                     fluxSink.complete();
-                    this.waitForTermination.countDown();
                 }
             }
         );
@@ -148,12 +175,16 @@ public class RealtimeTrigger extends AbstractTrigger implements RealtimeTriggerI
     }
 
     private void stop(boolean wait) {
-        if (!isActive.compareAndSet(true, false)) {
-            return;
+        isActive.set(false);
+        var factory = factoryRef.get();
+        if (factory != null) {
+            factory.closeAsync();
         }
-        if (wait) {
+        var termination = waitForTermination.get();
+        if (wait && termination != null) {
             try {
-                this.waitForTermination.await();
+                // Opening a connection cannot be interrupted through factoryRef until it is published.
+                termination.await(5, TimeUnit.SECONDS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }

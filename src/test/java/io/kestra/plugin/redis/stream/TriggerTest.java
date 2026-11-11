@@ -24,7 +24,6 @@ import io.kestra.core.models.flows.Flow;
 import io.kestra.core.models.flows.State;
 import io.kestra.core.models.property.Property;
 import io.kestra.core.models.triggers.TriggerContext;
-import io.kestra.plugin.core.debug.Return;
 import io.kestra.core.queues.QueueFactoryInterface;
 import io.kestra.core.queues.QueueInterface;
 import io.kestra.core.repositories.LocalFlowRepositoryLoader;
@@ -34,6 +33,8 @@ import io.kestra.core.runners.RunContextInitializer;
 import io.kestra.core.serializers.YamlParser;
 import io.kestra.core.utils.IdUtils;
 import io.kestra.core.utils.TestsUtils;
+import io.kestra.plugin.core.debug.Return;
+import io.kestra.plugin.redis.StallingProxy;
 
 import jakarta.inject.Inject;
 import jakarta.inject.Named;
@@ -133,9 +134,13 @@ class TriggerTest {
 
         // verified on a separate connection: the trigger acknowledged nothing, the entries wait for the flow's Ack
         try (var fixture = new StreamFixture(REDIS_URI)) {
-            assertThat(fixture.owners(FLOW_KEYS.getFirst(), GROUP), is(Map.of(
-                entryIds.get(0), CONSUMER, entryIds.get(1), CONSUMER, entryIds.get(2), CONSUMER
-            )));
+            assertThat(
+                fixture.owners(FLOW_KEYS.getFirst(), GROUP), is(
+                    Map.of(
+                        entryIds.get(0), CONSUMER, entryIds.get(1), CONSUMER, entryIds.get(2), CONSUMER
+                    )
+                )
+            );
         }
     }
 

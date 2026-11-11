@@ -1,4 +1,4 @@
-package io.kestra.plugin.redis.stream;
+package io.kestra.plugin.redis;
 
 import java.io.ByteArrayOutputStream;
 import java.io.EOFException;
@@ -14,12 +14,14 @@ import java.util.concurrent.TimeUnit;
 
 // A TCP proxy in front of a real Redis that forwards everything except one command, which it reads but never answers,
 // so a client call to that command hangs like it would against a stuck server until the connection is closed.
-final class StallingProxy implements AutoCloseable {
+public final class StallingProxy implements AutoCloseable {
     private final ServerSocket serverSocket;
     private final String backendHost;
     private final int backendPort;
     private final String stalledCommand;
     private final CountDownLatch stalled = new CountDownLatch(1);
+
+    private final CountDownLatch disconnected = new CountDownLatch(1);
 
     private StallingProxy(ServerSocket serverSocket, String backendHost, int backendPort, String stalledCommand) {
         this.serverSocket = serverSocket;
@@ -32,16 +34,20 @@ final class StallingProxy implements AutoCloseable {
         acceptThread.start();
     }
 
-    static StallingProxy start(String backendHost, int backendPort, String stalledCommand) throws IOException {
+    public static StallingProxy start(String backendHost, int backendPort, String stalledCommand) throws IOException {
         return new StallingProxy(new ServerSocket(0, 50, InetAddress.getLoopbackAddress()), backendHost, backendPort, stalledCommand);
     }
 
-    int getPort() {
+    public int getPort() {
         return serverSocket.getLocalPort();
     }
 
-    boolean awaitStalled(Duration timeout) throws InterruptedException {
+    public boolean awaitStalled(Duration timeout) throws InterruptedException {
         return stalled.await(timeout.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    public boolean awaitDisconnected(Duration timeout) throws InterruptedException {
+        return disconnected.await(timeout.toMillis(), TimeUnit.MILLISECONDS);
     }
 
     private void acceptLoop() {
@@ -58,6 +64,7 @@ final class StallingProxy implements AutoCloseable {
     }
 
     private void handleClient(Socket client) {
+        boolean commandStalled = false;
         try (client; var backend = new Socket(backendHost, backendPort)) {
             var backendToClient = new Thread(() -> pipe(backend, client), "redis-stalling-proxy-b2c");
             backendToClient.setDaemon(true);
@@ -68,6 +75,7 @@ final class StallingProxy implements AutoCloseable {
             byte[] command;
             while ((command = readCommand(in)) != null) {
                 if (isStalled(command)) {
+                    commandStalled = true;
                     stalled.countDown();
                 } else {
                     out.write(command);
@@ -76,6 +84,10 @@ final class StallingProxy implements AutoCloseable {
             }
         } catch (IOException ignored) {
             // the client or the backend closed the connection, for example when a kill tears the socket down
+        } finally {
+            if (commandStalled) {
+                disconnected.countDown();
+            }
         }
     }
 
